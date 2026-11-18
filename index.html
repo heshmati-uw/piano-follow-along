@@ -79,6 +79,7 @@ button:active { transform: translateY(1px); }
   -webkit-user-select: text; user-select: text;
 }
 .notice.show { display: flex; }
+.notice.ok { border-color: var(--teal); }
 .notice p { margin: 0; flex: 1; }
 .notice button { min-height: 32px; font-size: 13px; }
 
@@ -126,6 +127,12 @@ select { background: var(--ink); border: 1px solid var(--line); border-radius: 1
 #sens { accent-color: var(--saffron); width: 100%; }
 .dialog-foot { display: flex; justify-content: flex-end; }
 .err { color: var(--pome); font-size: 14px; min-height: 1.2em; }
+details.field summary { font-weight: 600; cursor: pointer; min-height: 32px; }
+details.field p { margin: 6px 0; }
+details.field a { color: var(--saffron); }
+input[type="password"] { background: var(--ink); border: 1px solid var(--line); border-radius: 10px; min-height: 44px; padding: 0 10px; width: 100%; -webkit-user-select: text; user-select: text; }
+.stack { display: flex; flex-direction: column; gap: 8px; }
+[hidden] { display: none !important; }
 
 @media (max-height: 520px) {
   .note-big { font-size: 34px; }
@@ -185,9 +192,14 @@ select { background: var(--ink); border: 1px solid var(--line); border-radius: 1
 <dialog id="settings" aria-labelledby="settingsTitle">
   <h2 id="settingsTitle">Song &amp; settings</h2>
   <div class="field">
-    <span class="label">Song</span>
+    <label for="lib">Shared songs</label>
+    <select id="lib"><option value="">Loading the list</option></select>
+    <small id="libNote">Songs in this app's library. Anyone can pick one.</small>
+  </div>
+  <div class="field">
+    <span class="label">Your own file</span>
     <label class="file-btn">Load a MIDI file<input type="file" id="file"></label>
-    <small>Pick a .mid file from your device. It stays on this device.</small>
+    <small id="fileNote">Pick a .mid file from your device.</small>
     <div class="err" id="fileErr" role="alert"></div>
   </div>
   <div class="field">
@@ -206,6 +218,17 @@ select { background: var(--ink); border: 1px solid var(--line); border-radius: 1
     <input type="range" id="sens" min="0" max="100" value="60">
     <small>Raise it if quiet notes are missed. Lower it if room noise sets it off.</small>
   </div>
+  <details class="field" id="keyBox">
+    <summary>Saving to the shared library</summary>
+    <p><small id="keyState"></small></p>
+    <div class="stack" id="keyForm">
+      <label for="ghKey">GitHub access token</label>
+      <input type="password" id="ghKey" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <button type="button" id="keySave">Keep token on this device</button>
+    </div>
+    <button type="button" id="keyClear" hidden>Remove token from this device</button>
+    <p><small>Without a token, files can be added by hand <a id="uploadLink" href="#" target="_blank" rel="noopener">on GitHub</a>.</small></p>
+  </details>
   <div class="dialog-foot"><button type="button" id="settingsClose">Done</button></div>
 </dialog>
 
@@ -542,7 +565,7 @@ if (typeof module !== 'undefined') module.exports = Core;
   const S = {
     song: null, name: '', b64: null, partIdx: 0, steps: [], cur: 0, flats: false, range: { lo: 60, hi: 76 },
     firstTry: 0, slips: 0, stepMissed: false, results: [], viewTick: 0, endTick: 0,
-    flashes: new Map(), listening: false,
+    flashes: new Map(), listening: false, libName: '',
   };
   const listener = new Core.Listener();
 
@@ -681,7 +704,7 @@ if (typeof module !== 'undefined') module.exports = Core;
   // ---------- Microphone ----------
   let stream = null, analyser = null, micNodes = [], tbuf = null, bbuf = null, wake = null;
   const MIC_HELP = 'The microphone is not available here. Open this page in Safari from an https address and allow the microphone when asked. Until then you can tap the keys on screen.';
-  function notice(text) { $('noticeText').textContent = text; $('notice').classList.add('show'); }
+  function notice(text, ok) { $('noticeText').textContent = text; $('notice').classList.toggle('ok', !!ok); $('notice').classList.add('show'); }
 
   async function startListening() {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { notice(MIC_HELP); return; }
@@ -858,6 +881,100 @@ if (typeof module !== 'undefined') module.exports = Core;
     tapKey(hit);
   });
 
+  // ---------- Shared library: MIDI files in the songs folder of the GitHub repository ----------
+  // Anyone can read the list. Saving needs the repository owner's access token, which is
+  // typed in by the owner and kept only in this browser.
+  const GH = (() => {
+    const h = location.hostname, seg = location.pathname.split('/').filter(Boolean);
+    const pages = /\.github\.io$/i.test(h) && seg.length > 0 && !/\.html?$/i.test(seg[0]);
+    return { owner: pages ? h.split('.')[0] : 'heshmati-uw', repo: pages ? seg[0] : 'piano-follow-along', branch: 'main', dir: 'songs' };
+  })();
+  const API = `https://api.github.com/repos/${GH.owner}/${GH.repo}/contents/${GH.dir}`;
+  const TOKEN_KEY = 'piano-follow-along-gh-token', LIB_KEY = 'piano-follow-along-library';
+  const token = {
+    get() { try { return localStorage.getItem(TOKEN_KEY) || ''; } catch (e) { return ''; } },
+    set(v) { try { if (v) localStorage.setItem(TOKEN_KEY, v); else localStorage.removeItem(TOKEN_KEY); return true; } catch (e) { return false; } },
+  };
+  let library = [];
+  const ghHeaders = withToken => { const h = { Accept: 'application/vnd.github+json' }; const t = token.get(); if (t && withToken) h.Authorization = 'Bearer ' + t; return h; };
+  const pretty = file => file.replace(/\.(mid|midi)$/i, '').replace(/^[0-9a-f]{8}-/i, '').replace(/[-_]+/g, ' ').trim().replace(/\b[a-z]/g, ch => ch.toUpperCase()) || 'My song';
+  const safeName = file => (file.replace(/\.(mid|midi)$/i, '').replace(/^[0-9a-f]{8}-/i, '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80) || 'song') + '.mid';
+
+  function renderLibrary(note) {
+    const sel = $('lib'); sel.innerHTML = '';
+    const first = document.createElement('option');
+    first.value = ''; first.textContent = library.length ? 'Choose a song' : 'No shared songs yet';
+    sel.appendChild(first);
+    library.forEach(f => { const o = document.createElement('option'); o.value = f.name; o.textContent = pretty(f.name); sel.appendChild(o); });
+    sel.disabled = !library.length;
+    if (S.libName && library.some(f => f.name === S.libName)) sel.value = S.libName;
+    $('libNote').textContent = note || "Songs in this app's library. Anyone can pick one.";
+  }
+  async function loadLibrary() {
+    let note = '';
+    try {
+      let r = await fetch(`${API}?ref=${GH.branch}`, { headers: ghHeaders(true), cache: 'no-store' });
+      if (r.status === 401 && token.get()) r = await fetch(`${API}?ref=${GH.branch}`, { headers: ghHeaders(false), cache: 'no-store' });
+      if (r.status === 404) library = [];
+      else if (!r.ok) throw new Error('GitHub answered ' + r.status);
+      else library = (await r.json()).filter(f => f.type === 'file' && /\.(mid|midi)$/i.test(f.name)).map(f => ({ name: f.name, size: f.size, url: f.download_url }));
+      try { localStorage.setItem(LIB_KEY, JSON.stringify(library)); } catch (e) { /* no storage */ }
+    } catch (e) {
+      try { library = JSON.parse(localStorage.getItem(LIB_KEY) || '[]') || []; } catch (e2) { library = []; }
+      note = 'The song list could not be refreshed. Check your connection and reopen this panel.';
+    }
+    renderLibrary(note);
+  }
+  async function pickFromLibrary(name) {
+    const f = library.find(x => x.name === name); if (!f) return;
+    $('libNote').textContent = 'Loading ' + pretty(name);
+    try {
+      const r = await fetch(f.url || `https://raw.githubusercontent.com/${GH.owner}/${GH.repo}/${GH.branch}/${GH.dir}/${encodeURIComponent(name)}`);
+      if (!r.ok) throw new Error('GitHub answered ' + r.status);
+      const u8 = new Uint8Array(await r.arrayBuffer());
+      const song = Core.parseMidi(u8);
+      S.libName = name;
+      setSong(song, pretty(name), u8.length < 700000 ? toB64(u8) : null, null);
+      renderLibrary();
+      if (dlg.close) dlg.close(); else dlg.removeAttribute('open');
+    } catch (e) {
+      renderLibrary('That song could not be loaded. ' + (e && e.message ? e.message : ''));
+    }
+  }
+  async function saveToLibrary(fileName, u8) {
+    if (!token.get()) return;
+    const name = safeName(fileName);
+    if (library.some(f => f.name === name)) { notice(`${pretty(name)} is already in the shared library.`, true); return; }
+    if (u8.length > 1000000) { notice('This file is too large for the shared library. It still works on this device.'); return; }
+    try {
+      const r = await fetch(`${API}/${encodeURIComponent(name)}`, {
+        method: 'PUT', headers: Object.assign(ghHeaders(true), { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ message: `Add ${name} to the song library`, content: toB64(u8), branch: GH.branch }),
+      });
+      if (r.status === 201 || r.status === 200) {
+        let url = ''; try { url = (await r.json()).content.download_url || ''; } catch (e) { /* use the default address */ }
+        library.push({ name, size: u8.length, url }); library.sort((a, b) => a.name.localeCompare(b.name));
+        S.libName = name; renderLibrary();
+        notice(`Saved ${pretty(name)} to the shared library. Anyone using this app can now pick it.`, true);
+      } else if (r.status === 422 || r.status === 409) {
+        notice(`${pretty(name)} is already in the shared library.`, true); loadLibrary();
+      } else if (r.status === 401 || r.status === 403 || r.status === 404) {
+        notice('GitHub refused the save. The access token may have expired, or it does not allow Contents read and write on this repository. The song still works on this device.');
+      } else notice(`The song was not saved to the shared library (GitHub answered ${r.status}). It still works on this device.`);
+    } catch (e) {
+      notice('The song was not saved to the shared library because GitHub could not be reached. It still works on this device.');
+    }
+  }
+  function renderKey() {
+    const has = !!token.get();
+    $('keyState').textContent = has
+      ? 'This device has an access token. Every MIDI file you load here is also saved to the shared library, where anyone can pick it and download it.'
+      : 'Only the owner of the GitHub repository needs this. Paste a fine-grained access token that is limited to this one repository, with Contents set to Read and write. It is kept in this browser only.';
+    $('keyForm').hidden = has; $('keyClear').hidden = !has;
+    $('fileNote').textContent = has ? 'Pick a .mid file from your device. It will also be saved to the shared library.' : 'Pick a .mid file from your device. It stays on this device.';
+    $('uploadLink').href = `https://github.com/${GH.owner}/${GH.repo}/upload/${GH.branch}/${GH.dir}`;
+  }
+
   // ---------- Controls ----------
   $('listenBtn').addEventListener('click', () => (S.listening ? stopListening() : startListening()));
   $('backBtn').addEventListener('click', () => jump(S.cur - 1));
@@ -875,7 +992,15 @@ if (typeof module !== 'undefined') module.exports = Core;
   $('noticeClose').addEventListener('click', () => $('notice').classList.remove('show'));
 
   const dlg = $('settings');
-  $('settingsBtn').addEventListener('click', () => { $('fileErr').textContent = ''; if (dlg.showModal) dlg.showModal(); else dlg.setAttribute('open', ''); });
+  $('settingsBtn').addEventListener('click', () => { $('fileErr').textContent = ''; if (dlg.showModal) dlg.showModal(); else dlg.setAttribute('open', ''); loadLibrary(); });
+  $('lib').addEventListener('change', ev => { if (ev.target.value) pickFromLibrary(ev.target.value); });
+  $('keySave').addEventListener('click', () => {
+    const v = $('ghKey').value.trim(); if (!v) return;
+    $('ghKey').value = '';
+    if (!token.set(v)) { $('keyState').textContent = 'This browser would not store the token.'; return; }
+    renderKey(); loadLibrary();
+  });
+  $('keyClear').addEventListener('click', () => { token.set(''); renderKey(); });
   $('settingsClose').addEventListener('click', () => { if (dlg.close) dlg.close(); else dlg.removeAttribute('open'); });
   $('part').addEventListener('change', ev => setPart(+ev.target.value, 0));
   $('anyOct').addEventListener('change', ev => { listener.anyOctave = ev.target.checked; save(); });
@@ -886,10 +1011,11 @@ if (typeof module !== 'undefined') module.exports = Core;
     try {
       const u8 = new Uint8Array(await f.arrayBuffer());
       const song = Core.parseMidi(u8);
-      const name = f.name.replace(/\.(mid|midi)$/i, '').replace(/^[0-9a-f]{8}-/i, '').replace(/[-_]+/g, ' ').trim().replace(/\b[a-z]/g, ch => ch.toUpperCase()) || 'My song';
-      setSong(song, name, u8.length < 700000 ? toB64(u8) : null, null);
+      S.libName = '';
+      setSong(song, pretty(f.name), u8.length < 700000 ? toB64(u8) : null, null);
       $('fileErr').textContent = '';
       if (dlg.close) dlg.close();
+      saveToLibrary(f.name, u8);
     } catch (e) {
       $('fileErr').textContent = e && e.message ? e.message : 'That file could not be read.';
     }
@@ -910,6 +1036,7 @@ if (typeof module !== 'undefined') module.exports = Core;
     try { setSong(Core.parseMidi(fromB64(saved.b64)), saved.name || 'My song', saved.b64, saved); restored = true; } catch (e) { /* fall back to the example */ }
   }
   if (!restored) setSong(exampleSong(), 'C major scale (example)', null, null);
+  renderKey(); renderLibrary(); loadLibrary();
   if (window.ResizeObserver) new ResizeObserver(resize).observe($('stage')); else window.addEventListener('resize', resize);
   if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => { dirty = true; });
   requestAnimationFrame(loop);
