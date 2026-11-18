@@ -20,6 +20,7 @@
   --saffron: #f3b33d;    /* the note to play */
   --teal: #45cdb8;       /* right */
   --pome: #f0616a;       /* wrong */
+  --left: #8ea6ff;       /* the lower part, when both parts are shown */
   --display: "Fraunces", "Iowan Old Style", Georgia, serif;
   --body: "Figtree", -apple-system, "Segoe UI", system-ui, sans-serif;
   color-scheme: dark;
@@ -205,7 +206,7 @@ input[type="password"] { background: var(--ink); border: 1px solid var(--line); 
   <div class="field">
     <label for="part">Part to practice</label>
     <select id="part"></select>
-    <small>The highest part is usually the right-hand melody.</small>
+    <small>The highest part is usually the right-hand melody. With both parts together, turn the phone sideways for wider keys.</small>
   </div>
   <div class="field">
     <div class="check">
@@ -412,11 +413,12 @@ const Core = (() => {
       this.hist = []; this.armed = true; this.tArmed = true; this.onsetAt = -1e9; this.struckAt = -1e9; this.hasRef = false;
       this.cand = null; this.lastPc = -1; this.lastEmitT = -1e9;
       this.quietSince = null; this.unclearSince = null; this.muteUntil = -1e9;
+      this.sig = ''; this.seen = new Set(); this.seenAt = null;
       for (const s of this.ring) s.t = -1e9;
     }
     mute(t, ms) { this.muteUntil = Math.max(this.muteUntil, t + ms); }
 
-    process(t, win, sr, expected) {
+    process(t, win, sr, expected, opts) {
       const N = win.length, q = N >> 2;
       let e = 0; for (let i = N - q; i < N; i++) e += win[i] * win[i];
       const rms = Math.sqrt(e / q);
@@ -432,7 +434,7 @@ const Core = (() => {
 
       const hist = this.hist;
       hist.push(t, rms);
-      while (hist.length && t - hist[0] > 170) hist.splice(0, 2);
+      while (hist.length && t - hist[0] > 90) hist.splice(0, 2);
       if (t < this.muteUntil) { this.cand = null; this.onsetAt = -1e9; return res; }
 
       if (rms < this.floor) {
@@ -443,7 +445,7 @@ const Core = (() => {
       }
       this.quietSince = null;
 
-      // A new key strike shows up as a jump in level against the last 170 ms.
+      // A new key strike shows up as a jump in level against the last 90 ms.
       let before = null, struck = false;
       for (const s of this.ring) if (s.t <= t - 60 && s.t > -1e8 && (!before || s.t > before.t)) before = s;
       let mn = Infinity;
@@ -490,7 +492,15 @@ const Core = (() => {
       let m = -1, pc = -1, match = false;
       if (clear) {
         this.unclearSince = null;
-        m = Math.round(freqToMidi(p.freq)); pc = ((m % 12) + 12) % 12;
+        m = Math.round(freqToMidi(p.freq));
+        // Other ringing notes can pull the estimate off by a key, mostly in the bass. The key
+        // that was really struck carries more energy than its neighbours, so check them.
+        // (a key can also show up mainly through its octave, on small speakers or when the
+        // detector lands an octave low, so each key is judged by the stronger of the two)
+        const en = x => Math.max(pNow(x), pNow(x + 12));
+        const p0 = en(m), pLo = en(m - 1), pHi = en(m + 1), pBest = Math.max(pLo, pHi);
+        if (pBest >= 2 * p0 && pBest >= 0.02 * tot()) m += pHi > pLo ? 1 : -1;
+        pc = ((m % 12) + 12) % 12;
         const key = this.anyOctave ? pc : m;
         if (!this.cand || this.cand.key !== key) this.cand = { key, since: t, emitted: false };
         match = expected.some(x => (this.anyOctave ? x % 12 === pc : x === m));
@@ -503,15 +513,63 @@ const Core = (() => {
       const groups = new Map();
       for (const x of expected) { const g = x % 12; if (!groups.has(g)) groups.set(g, []); groups.get(g).push(x); }
       const chord = groups.size > 1;
+      const strict = chord && !!(opts && opts.requireAll);
+      const prev = (opts && opts.prev) || [];
+      const sig = expected.join(',');
+      if (sig !== this.sig) { this.sig = sig; this.seen = new Set(); this.seenAt = null; }
 
       const pRef = x => (this.hasRef ? powerAt(this.refBuf, N, sr, midiToFreq(x)) : 0);
-      const appeared = (x, frac, rise) => { const v = pNow(x); return v >= frac * tot() && v >= rise * (pRef(x) + 1e-10); };
+      const appeared = (x, frac, rise) => {
+        const v = pNow(x);
+        if (v < frac * tot() || v < rise * (pRef(x) + 1e-10)) return false;
+        return v >= 0.6 * Math.max(pNow(x - 1), pNow(x + 1)); // louder than the keys next to it
+      };
+      // was this key itself just struck? Its octave counts as evidence only when that octave
+      // is not one of the expected notes, which would explain the energy on its own
+      const hitNew = x => appeared(x, 0.02, 2) || (!expected.includes(x + 12) && appeared(x + 12, 0.02, 2));
+      const real = x => pNow(x) >= 0.02 * tot() || pNow(x + 12) >= 0.02 * tot();
+      // a note of the step just finished, landing a little late, is not a mistake
+      const late = x => prev.length > 0 && t - this.lastEmitT < 900 &&
+        prev.some(y => (this.anyOctave ? y % 12 === ((x % 12) + 12) % 12 : y === x));
+
+      // Both hands: every different note of the step has to show up. Hands rarely land at the
+      // same instant, so notes are ticked off as they appear and the step is done when all have.
+      // If only some arrive, the step is passed after a short wait and the rest are reported.
+      if (strict) {
+        const HARM = [12, 19, 24, 28, 31];
+        const shown = x => {
+          if (!(appeared(x, 0.04, 3) || (x < 60 && appeared(x + 12, 0.03, 3)))) return false;
+          // an overtone of a lower note in the same step is not proof that this key was struck
+          for (const y of expected) if (HARM.includes(x - y) && pNow(x) < 0.25 * pNow(y)) return false;
+          return true;
+        };
+        if (hasOnset && t - this.onsetAt >= 80) {
+          for (const [g, notes] of groups) if (!this.seen.has(g) && notes.some(shown)) this.seen.add(g);
+        }
+        if (clear && c && !c.emitted && match && t - c.since >= 55 && (hasOnset || pc !== this.lastPc) && real(m)) {
+          this.seen.add(pc); c.emitted = true;
+        }
+        if (this.seen.size && this.seenAt === null) this.seenAt = t;
+        if (this.seen.size === groups.size) { res.out = this._emit('right', Math.max.apply(null, expected), t); return res; }
+        if (this.seenAt !== null && t - this.seenAt >= 250) {
+          const missing = [], got = [];
+          for (const [g, notes] of groups) (this.seen.has(g) ? got : missing).push(...notes);
+          res.out = this._emit('partial', Math.max.apply(null, got), t); res.out.missing = missing;
+          return res;
+        }
+        if (!this.seen.size && clear && c && !c.emitted && !match && hasOnset && t - c.since >= 200 &&
+            hitNew(m)) {
+          if (late(m)) { c.emitted = true; this.onsetAt = -1e9; }
+          else res.out = this._emit('wrong', m, t);
+        }
+        return res;
+      }
 
       // (B) every expected note newly present after a strike
       if (hasOnset && t - this.onsetAt >= 80 && expected.length) {
         // a clearly heard different note vetoes this path, but only if that note really sounded
         const blocked = !chord && clear && c && !match && c.since >= this.onsetAt - 30 &&
-          (appeared(m, 0.02, 2) || appeared(m + 12, 0.02, 2));
+          hitNew(m);
         if (!blocked) {
           let all = true;
           for (const notes of groups.values()) { if (!notes.some(x => appeared(x, 0.05, 3))) { all = false; break; } }
@@ -525,9 +583,10 @@ const Core = (() => {
         if (match) {
           // two notes struck together can fool the detector into a phantom low note, so the
           // heard note (or its octave, on small speakers) has to carry real energy
-          if (held >= 55 && (hasOnset || !same) && (pNow(m) >= 0.02 * tot() || pNow(m + 12) >= 0.02 * tot())) res.out = this._emit('right', m, t);
-        } else if (hasOnset && held >= (chord ? 200 : 110) && (appeared(m, 0.02, 2) || appeared(m + 12, 0.02, 2))) {
-          res.out = this._emit('wrong', m, t);
+          if (held >= 55 && (hasOnset || !same) && real(m)) res.out = this._emit('right', m, t);
+        } else if (hasOnset && held >= (chord ? 200 : 110) && hitNew(m)) {
+          if (late(m)) { c.emitted = true; this.onsetAt = -1e9; }
+          else res.out = this._emit('wrong', m, t);
         }
       }
       return res;
@@ -539,7 +598,7 @@ const Core = (() => {
     }
   }
 
-  return { parseMidi, buildSteps, noteName, isBlack, preferFlats, keyboardRange, decimate, detectPitch, freqToMidi, midiToFreq, Listener };
+  return { powerAt, parseMidi, buildSteps, noteName, isBlack, preferFlats, keyboardRange, decimate, detectPitch, freqToMidi, midiToFreq, Listener };
 })();
 if (typeof module !== 'undefined') module.exports = Core;
 </script>
@@ -550,7 +609,7 @@ if (typeof module !== 'undefined') module.exports = Core;
   const $ = id => document.getElementById(id);
   const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
   const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
-  const C = { ink: css('--ink'), ink2: css('--ink-2'), line: css('--line'), paper: css('--paper'), mute: css('--mute'), saffron: css('--saffron'), teal: css('--teal'), pome: css('--pome') };
+  const C = { ink: css('--ink'), ink2: css('--ink-2'), line: css('--line'), paper: css('--paper'), mute: css('--mute'), saffron: css('--saffron'), teal: css('--teal'), pome: css('--pome'), left: css('--left') };
 
   // ---------- Saved state (this device only) ----------
   const KEY = 'piano-follow-along-v1';
@@ -565,7 +624,7 @@ if (typeof module !== 'undefined') module.exports = Core;
   const S = {
     song: null, name: '', b64: null, partIdx: 0, steps: [], cur: 0, flats: false, range: { lo: 60, hi: 76 },
     firstTry: 0, slips: 0, stepMissed: false, results: [], viewTick: 0, endTick: 0,
-    flashes: new Map(), listening: false, libName: '',
+    flashes: new Map(), listening: false, libName: '', tapped: new Set(),
   };
   const listener = new Core.Listener();
 
@@ -585,13 +644,19 @@ if (typeof module !== 'undefined') module.exports = Core;
       o.textContent = `${p.name || p.label} · ${p.notes.length} notes · ${Core.noteName(p.lo, flats)} to ${Core.noteName(p.hi, flats)}${i === song.melody && song.parts.length > 1 ? ' (highest)' : ''}`;
       sel.appendChild(o);
     });
-    const idx = saved && saved.partIdx < song.parts.length ? saved.partIdx : song.melody;
-    setPart(idx, saved ? saved.cur : 0);
+    if (song.parts.length > 1) {
+      const o = document.createElement('option');
+      o.value = -1;
+      o.textContent = `${song.parts.length === 2 ? 'Both parts' : 'All parts'} together · ${song.parts.reduce((a, p) => a + p.notes.length, 0)} notes`;
+      sel.appendChild(o);
+    }
+    const ok = saved && typeof saved.partIdx === 'number' && saved.partIdx < song.parts.length && (saved.partIdx >= 0 || song.parts.length > 1);
+    setPart(ok ? saved.partIdx : song.melody, saved ? saved.cur : 0);
   }
 
   function setPart(idx, cur) {
     S.partIdx = idx; $('part').value = idx;
-    const p = S.song.parts[idx];
+    const p = idx < 0 ? togetherPart(S.song) : S.song.parts[idx];
     S.steps = Core.buildSteps(p.notes, S.song.division);
     S.flats = Core.preferFlats(S.song, p.notes);
     S.range = Core.keyboardRange(p.lo, p.hi);
@@ -600,14 +665,25 @@ if (typeof module !== 'undefined') module.exports = Core;
     S.firstTry = 0; S.slips = 0;
     $('seek').max = Math.max(1, S.steps.length);
     $('songName').textContent = S.name;
-    $('songPart').textContent = S.song.parts.length > 1 ? `${p.name || p.label} of ${S.song.parts.length}` : `${S.steps.length} notes`;
+    $('songPart').textContent = idx < 0 ? p.label : (S.song.parts.length > 1 ? `${p.name || p.label} of ${S.song.parts.length}` : `${S.steps.length} notes`);
     buildKeys();
     jump(Math.min(cur || 0, S.steps.length), true);
   }
 
+  // All parts merged into one. hand 0 is the highest part (melody), hand 1 everything below it.
+  function togetherPart(song) {
+    const notes = [];
+    song.parts.forEach((q, i) => q.notes.forEach(n => notes.push({ tick: n.tick, dur: n.dur, midi: n.midi, vel: n.vel, hand: i === song.melody ? 0 : 1 })));
+    notes.sort((a, b) => a.tick - b.tick || a.midi - b.midi);
+    let lo = 127, hi = 0; for (const n of notes) { if (n.midi < lo) lo = n.midi; if (n.midi > hi) hi = n.midi; }
+    return { label: song.parts.length === 2 ? 'Both parts together' : 'All parts together', name: '', notes, lo, hi };
+  }
+  const together = () => S.partIdx < 0;
+  const prevNotes = () => (S.cur > 0 && S.cur <= S.steps.length && S.steps[S.cur - 1].notes.length > 1 ? S.steps[S.cur - 1].notes.map(n => n.midi) : []);
+
   function jump(i, snap) {
     S.cur = Math.max(0, Math.min(S.steps.length, i));
-    S.stepMissed = false;
+    S.stepMissed = false; S.tapped.clear();
     listener.reset();
     if (snap || reduceMotion) S.viewTick = targetTick();
     setChip('', '');
@@ -627,7 +703,9 @@ if (typeof module !== 'undefined') module.exports = Core;
       const ex = [...new Set(expected())].sort((a, b) => a - b);
       big.textContent = ex.map(m => Core.noteName(m, S.flats)).join(' + ');
       big.classList.toggle('multi', ex.length > 1);
-      $('promptLabel').textContent = ex.length > 1 ? 'Play the lit keys. One of them is enough' : (S.listening ? 'Listening. Play the lit key' : 'Play the lit key');
+      const kinds = new Set(ex.map(m => m % 12)).size;
+      $('promptLabel').textContent = together() && kinds > 1 ? 'Play all the lit keys together'
+        : ex.length > 1 ? 'Play the lit keys. One of them is enough' : (S.listening ? 'Listening. Play the lit key' : 'Play the lit key');
     }
     $('seek').value = S.cur;
     $('count').textContent = `${Math.min(S.cur + (done ? 0 : 1), n)} of ${n}`;
@@ -650,14 +728,21 @@ if (typeof module !== 'undefined') module.exports = Core;
 
   // ---------- Judging a played note (from the microphone or a tap) ----------
   function flash(midi, color, ms) { S.flashes.set(midi, { color, until: performance.now() + ms, ms }); dirty = true; }
-  function judge(result, heard) {
+  function judge(result, heard, missing) {
     if (S.cur >= S.steps.length) return;
-    if (result === 'right') {
+    if (result === 'partial') {
+      // some of a both-hands step was heard: move on, and say which keys were not
+      missing.forEach(m => flash(m, C.pome, 800));
+      if (!S.stepMissed) S.slips++;
+      S.results[S.cur] = 2; S.cur++; S.stepMissed = false; S.tapped.clear();
+      setChip('wrong', `Did not hear ${[...new Set(missing)].map(m => Core.noteName(m, S.flats)).join(', ')}`);
+      refresh();
+    } else if (result === 'right') {
       const ex = expected();
       const lit = ex.includes(heard) ? [heard] : ex;
       lit.forEach(m => flash(m, C.teal, 380));
       if (S.stepMissed) { S.results[S.cur] = 2; } else { S.firstTry++; S.results[S.cur] = 1; }
-      S.cur++; S.stepMissed = false;
+      S.cur++; S.stepMissed = false; S.tapped.clear();
       setChip('right', 'Right');
       refresh();
     } else {
@@ -671,8 +756,16 @@ if (typeof module !== 'undefined') module.exports = Core;
     playTone([midi], 0.5);
     listener.mute(now, 650);
     const ex = expected();
-    const ok = ex.some(e => (listener.anyOctave ? e % 12 === midi % 12 : e === midi));
-    judge(ok ? 'right' : 'wrong', midi);
+    const hit = ex.filter(e => (listener.anyOctave ? e % 12 === midi % 12 : e === midi));
+    if (!hit.length) { judge('wrong', midi); return; }
+    const kinds = new Set(ex.map(e => e % 12));
+    if (together() && kinds.size > 1) {
+      // on screen, the keys of a both-hands step are tapped one after another
+      hit.forEach(e => S.tapped.add(e % 12));
+      const left = [...kinds].filter(k => !S.tapped.has(k)).length;
+      if (left) { flash(midi, C.teal, 380); setChip('info', left === 1 ? 'One more key' : `${left} more keys`); return; }
+    }
+    judge('right', midi);
   }
 
   // ---------- Sound out (Hear it, tapped keys) ----------
@@ -749,10 +842,10 @@ if (typeof module !== 'undefined') module.exports = Core;
     if (!analyser) return;
     if (analyser.getFloatTimeDomainData) analyser.getFloatTimeDomainData(tbuf);
     else { analyser.getByteTimeDomainData(bbuf); for (let i = 0; i < bbuf.length; i++) tbuf[i] = (bbuf[i] - 128) / 128; }
-    const { rms, out } = listener.process(now, tbuf, actx.sampleRate, expected());
+    const { rms, out } = listener.process(now, tbuf, actx.sampleRate, expected(), { requireAll: together(), prev: prevNotes() });
     const db = 20 * Math.log10(Math.max(rms, 1e-5));
     $('level').style.width = Math.max(0, Math.min(100, ((db + 60) / 50) * 100)) + '%';
-    if (out) judge(out.result, out.heard);
+    if (out) judge(out.result, out.heard, out.missing);
   }
 
   // ---------- Drawing: falling notes over a keyboard ----------
@@ -810,9 +903,10 @@ if (typeof module !== 'undefined') module.exports = Core;
         const h = Math.max(10, n.dur * ppt - 3), y = yBase - h;
         if (y > hitY) continue;
         const inset = k.black ? 1 : Math.min(4, k.w * 0.14);
-        if (si === S.cur) { g.fillStyle = C.saffron; g.shadowColor = C.saffron; g.shadowBlur = 14; g.globalAlpha = 1; }
+        const tone = n.hand === 1 ? C.left : C.saffron;
+        if (si === S.cur) { g.fillStyle = tone; g.shadowColor = tone; g.shadowBlur = 14; g.globalAlpha = 1; }
         else if (si < S.cur) { g.fillStyle = S.results[si] === 2 ? C.pome : C.teal; g.shadowBlur = 0; g.globalAlpha = 0.5; }
-        else { g.fillStyle = C.saffron; g.shadowBlur = 0; g.globalAlpha = k.black ? 0.34 : 0.46; }
+        else { g.fillStyle = tone; g.shadowBlur = 0; g.globalAlpha = k.black ? 0.4 : 0.5; }
         rr(k.x + inset, y, k.w - inset * 2, h, 5); g.fill();
       }
     }
@@ -822,7 +916,8 @@ if (typeof module !== 'undefined') module.exports = Core;
     g.fillStyle = C.saffron; g.fillRect(0, hitY - 2, W, 2);
 
     // keyboard
-    const ex = new Set(expected());
+    const ex = new Map();
+    if (S.cur < S.steps.length) S.steps[S.cur].notes.forEach(n => ex.set(n.midi, n.hand === 1 ? C.left : C.saffron));
     const tint = m => {
       const f = S.flashes.get(m);
       if (f) { if (now < f.until) return { color: f.color, a: reduceMotion ? 1 : Math.min(1, (f.until - now) / f.ms + 0.25) }; S.flashes.delete(m); }
@@ -833,12 +928,12 @@ if (typeof module !== 'undefined') module.exports = Core;
     whites.forEach((m, i) => {
       const x = i * keyW + 0.75, w = keyW - 1.5;
       g.fillStyle = C.paper; rr(x, hitY + 1, w, kbH - 2, 5); g.fill();
-      if (ex.has(m)) { g.globalAlpha = pulse; g.fillStyle = C.saffron; rr(x, hitY + 1, w, kbH - 2, 5); g.fill(); g.globalAlpha = 1; }
+      if (ex.has(m)) { g.globalAlpha = pulse; g.fillStyle = ex.get(m); rr(x, hitY + 1, w, kbH - 2, 5); g.fill(); g.globalAlpha = 1; }
       const t = tint(m); if (t) { g.globalAlpha = t.a; g.fillStyle = t.color; rr(x, hitY + 1, w, kbH - 2, 5); g.fill(); g.globalAlpha = 1; }
       const label = ex.has(m) ? Core.noteName(m, S.flats, false) : (m % 12 === 0 ? Core.noteName(m, S.flats) : '');
-      if (label && keyW >= 15) {
+      if (label && keyW >= 11) {
         g.fillStyle = ex.has(m) ? C.ink : 'rgba(19,25,51,0.55)';
-        g.font = `${ex.has(m) ? 700 : 500} ${Math.min(14, keyW * 0.5)}px Figtree, system-ui, sans-serif`;
+        g.font = `${ex.has(m) ? 700 : 500} ${Math.max(8.5, Math.min(14, keyW * 0.5))}px Figtree, system-ui, sans-serif`;
         g.textAlign = 'center'; g.textBaseline = 'alphabetic';
         g.fillText(label, x + w / 2, hitY + kbH - 9);
       }
@@ -846,7 +941,7 @@ if (typeof module !== 'undefined') module.exports = Core;
     blacks.forEach(m => {
       const k = rect.get(m); if (!k) return;
       g.fillStyle = '#0b0f22'; rr(k.x, hitY, k.w, blackH, 4); g.fill();
-      if (ex.has(m)) { g.globalAlpha = pulse; g.fillStyle = C.saffron; rr(k.x, hitY, k.w, blackH, 4); g.fill(); g.globalAlpha = 1; }
+      if (ex.has(m)) { g.globalAlpha = pulse; g.fillStyle = ex.get(m); rr(k.x, hitY, k.w, blackH, 4); g.fill(); g.globalAlpha = 1; }
       const t = tint(m); if (t) { g.globalAlpha = t.a; g.fillStyle = t.color; rr(k.x, hitY, k.w, blackH, 4); g.fill(); g.globalAlpha = 1; }
       if (ex.has(m) && k.w >= 15) {
         g.fillStyle = C.ink; g.font = `700 ${Math.min(12, k.w * 0.55)}px Figtree, system-ui, sans-serif`;
