@@ -210,8 +210,8 @@ input[type="password"] { background: var(--ink); border: 1px solid var(--line); 
   </div>
   <div class="field">
     <div class="check">
-      <input type="checkbox" id="anyOct" checked>
-      <label for="anyOct">Count the right note in any octave<br><small>Recommended with a microphone, which can mistake a note for its octave.</small></label>
+      <input type="checkbox" id="anyOct">
+      <label for="anyOct">Count the right note in any octave<br><small>Leave this off to be held to the exact key. Turn it on only if correct notes get marked as the wrong octave.</small></label>
     </div>
   </div>
   <div class="field">
@@ -408,7 +408,7 @@ const Core = (() => {
   // Design choice: quick to accept a right note, slow to call a note wrong.
   const RING = 12;
   class Listener {
-    constructor() { this.floor = 0.008; this.anyOctave = true; this.ring = []; this.ri = 0; this.refBuf = null; this.dec = new Float32Array(0); this.reset(); }
+    constructor() { this.floor = 0.008; this.anyOctave = false; this.ring = []; this.ri = 0; this.refBuf = null; this.dec = new Float32Array(0); this.reset(); }
     reset() {
       this.hist = []; this.armed = true; this.tArmed = true; this.onsetAt = -1e9; this.struckAt = -1e9; this.hasRef = false;
       this.cand = null; this.lastPc = -1; this.lastEmitT = -1e9;
@@ -500,6 +500,19 @@ const Core = (() => {
         const en = x => Math.max(pNow(x), pNow(x + 12));
         const p0 = en(m), pLo = en(m - 1), pHi = en(m + 1), pBest = Math.max(pLo, pHi);
         if (pBest >= 2 * p0 && pBest >= 0.02 * tot()) m += pHi > pLo ? 1 : -1;
+        // Settle the octave. When notes overlap the detector tends to land an octave low. A key
+        // that was really struck shows energy at its own pitch or at its third harmonic. If
+        // neither is there and the octave above is strong, the note is the octave above.
+        if (m >= 36) {
+          const up = pNow(m + 12);
+          if (up >= 0.02 * tot() && pNow(m) < 0.08 * up && pNow(m + 19) < 0.08 * up) m += 12;
+          else {
+            // The other way round: a thin-sounding low note can be taken for its octave. If the
+            // key an octave below and that key's third harmonic both carry energy, it is that key.
+            const here = pNow(m);
+            if (pNow(m - 12) >= 0.1 * here && pNow(m + 7) >= 0.1 * here) m -= 12;
+          }
+        }
         pc = ((m % 12) + 12) % 12;
         const key = this.anyOctave ? pc : m;
         if (!this.cand || this.cand.key !== key) this.cand = { key, since: t, emitted: false };
@@ -568,11 +581,17 @@ const Core = (() => {
       // (B) every expected note newly present after a strike
       if (hasOnset && t - this.onsetAt >= 80 && expected.length) {
         // a clearly heard different note vetoes this path, but only if that note really sounded
-        const blocked = !chord && clear && c && !match && c.since >= this.onsetAt - 30 &&
-          hitNew(m);
+        const blocked = !chord && clear && c && !match && hitNew(m);
         if (!blocked) {
           let all = true;
-          for (const notes of groups.values()) { if (!notes.some(x => appeared(x, 0.05, 3))) { all = false; break; } }
+          // with exact octaves, energy at the expected pitch does not count if the key an
+          // octave below was struck at the same moment, since that key rings at this pitch too
+          // (seen either at that lower key's own pitch or at its third harmonic, which a note
+          // struck at the expected pitch does not have)
+          const rose = (y, x) => pNow(y) >= 0.1 * pNow(x) && pNow(y) >= 3 * (pRef(y) + 1e-10);
+          const octaveBelow = x => !this.anyOctave && !expected.includes(x - 12) &&
+            (rose(x - 12, x) || (!expected.includes(x + 7) && rose(x + 7, x)));
+          for (const notes of groups.values()) { if (!notes.some(x => appeared(x, 0.05, 3) && !octaveBelow(x))) { all = false; break; } }
           if (all) { res.out = this._emit('right', Math.max.apply(null, expected), t); return res; }
         }
       }
@@ -721,7 +740,7 @@ if (typeof module !== 'undefined') module.exports = Core;
   }
 
   function save() {
-    store.set({ name: S.name, b64: S.b64, partIdx: S.partIdx, cur: S.cur >= S.steps.length ? 0 : S.cur, anyOctave: listener.anyOctave, sens: +$('sens').value });
+    store.set({ name: S.name, b64: S.b64, partIdx: S.partIdx, cur: S.cur >= S.steps.length ? 0 : S.cur, anyOctave: listener.anyOctave, sens: +$('sens').value, v: 2 });
   }
 
   function setChip(state, text) { const c = $('chip'); c.dataset.state = state; c.textContent = text || ' '; }
@@ -748,7 +767,8 @@ if (typeof module !== 'undefined') module.exports = Core;
     } else {
       flash(heard, C.pome, 600);
       if (!S.stepMissed) { S.slips++; S.stepMissed = true; }
-      setChip('wrong', `Heard ${Core.noteName(heard, S.flats)}`);
+      const sameName = expected().some(e => e % 12 === ((heard % 12) + 12) % 12);
+      setChip('wrong', `${sameName ? 'Wrong octave. Heard' : 'Heard'} ${Core.noteName(heard, S.flats)}`);
     }
   }
   function tapKey(midi) {
@@ -1122,7 +1142,9 @@ if (typeof module !== 'undefined') module.exports = Core;
   const saved = store.get();
   if (saved) {
     if (typeof saved.sens === 'number') $('sens').value = saved.sens;
-    if (typeof saved.anyOctave === 'boolean') { listener.anyOctave = saved.anyOctave; $('anyOct').checked = saved.anyOctave; }
+    // settings saved before exact octaves became the default carry no version, and their
+    // any-octave value was the old default and not a choice, so it is not carried over
+    if (saved.v === 2 && typeof saved.anyOctave === 'boolean') { listener.anyOctave = saved.anyOctave; $('anyOct').checked = saved.anyOctave; }
   }
   applySens();
   resize();
